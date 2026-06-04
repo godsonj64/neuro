@@ -3,15 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import subprocess
-import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 from PIL import Image
 
 from .real_text_quantized import process_events_to_quantized, require_aws_cli
@@ -20,7 +17,6 @@ from .utils import ensure_dir, save_json
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 EEG_EXTS = {".vhdr", ".vmrk", ".eeg", ".edf", ".bdf", ".set", ".fif"}
 NIFTI_EXTS = (".nii", ".nii.gz")
-TEXT_EXTS = {".json", ".tsv"}
 
 
 @dataclass(frozen=True)
@@ -45,9 +41,7 @@ def list_s3_objects(dataset: str) -> list[S3Object]:
         m = pattern.match(line.strip())
         if not m:
             continue
-        size = int(m.group(1))
-        key = m.group(2)
-        objects.append(S3Object(key=key, size=size))
+        objects.append(S3Object(key=m.group(2), size=int(m.group(1))))
     return objects
 
 
@@ -64,8 +58,7 @@ def suffix_of_key(key: str) -> str:
 
 
 def is_nifti(key: str) -> bool:
-    lower = key.lower()
-    return lower.endswith(NIFTI_EXTS)
+    return key.lower().endswith(NIFTI_EXTS)
 
 
 def is_eeg(key: str) -> bool:
@@ -76,8 +69,36 @@ def is_image(key: str) -> bool:
     return suffix_of_key(key) in IMAGE_EXTS
 
 
-def is_text(key: str) -> bool:
-    return suffix_of_key(key) in TEXT_EXTS or key.endswith("_events.tsv")
+def is_raw_eeg_candidate(key: str) -> bool:
+    lower = key.lower()
+    if "/derivatives/" in lower or "_ica" in lower or "ica/" in lower:
+        return False
+    if "/eeg/" not in lower:
+        return False
+    return is_eeg(lower)
+
+
+def choose_eeg_sets(small: list[S3Object], max_eeg_sets: int) -> list[S3Object]:
+    raw = [o for o in small if is_raw_eeg_candidate(o.key)]
+    eeg_by_stem: dict[str, list[S3Object]] = defaultdict(list)
+    for o in raw:
+        lower = o.key.lower()
+        stem = re.sub(r"\.(vhdr|vmrk|eeg|edf|bdf|set|fif)$", "", lower)
+        eeg_by_stem[stem].append(o)
+
+    complete_sets: list[list[S3Object]] = []
+    for _stem, group in eeg_by_stem.items():
+        exts = {suffix_of_key(g.key) for g in group}
+        if {".vhdr", ".vmrk", ".eeg"}.issubset(exts):
+            complete_sets.append(sorted(group, key=lambda o: o.key))
+        elif exts & {".edf", ".bdf", ".set", ".fif"}:
+            complete_sets.append(sorted(group, key=lambda o: o.key))
+
+    complete_sets = sorted(complete_sets, key=lambda group: sum(o.size for o in group))
+    chosen: list[S3Object] = []
+    for group in complete_sets[:max_eeg_sets]:
+        chosen.extend(group)
+    return chosen
 
 
 def choose_small_objects(
@@ -89,38 +110,20 @@ def choose_small_objects(
     max_file_mb: float,
 ) -> list[S3Object]:
     max_bytes = int(max_file_mb * 1024 * 1024)
-    small = [o for o in objects if o.size <= max_bytes and o.size > 0]
+    small = [o for o in objects if 0 < o.size <= max_bytes]
     chosen: list[S3Object] = []
 
-    # Prefer actual BOLD fMRI files, then any non-derived NIfTI, then any NIfTI.
     niftis = sorted(
         [o for o in small if is_nifti(o.key) and "bold" in o.key.lower() and "/derivatives/" not in o.key.lower()],
         key=lambda o: o.size,
     )
     if len(niftis) < max_nifti:
-        niftis = sorted(
-            [o for o in small if is_nifti(o.key) and "/derivatives/" not in o.key.lower()],
-            key=lambda o: o.size,
-        )
+        niftis = sorted([o for o in small if is_nifti(o.key) and "/derivatives/" not in o.key.lower()], key=lambda o: o.size)
     if len(niftis) < max_nifti:
         niftis = sorted([o for o in small if is_nifti(o.key)], key=lambda o: o.size)
     chosen.extend(niftis[:max_nifti])
 
-    # For BrainVision, include complete .vhdr/.vmrk/.eeg triplets with the same stem.
-    eeg_by_stem: dict[str, list[S3Object]] = defaultdict(list)
-    for o in small:
-        if is_eeg(o.key):
-            lower = o.key.lower()
-            stem = re.sub(r"\.(vhdr|vmrk|eeg|edf|bdf|set|fif)$", "", lower)
-            eeg_by_stem[stem].append(o)
-    eeg_sets = []
-    for _stem, group in eeg_by_stem.items():
-        exts = {suffix_of_key(g.key) for g in group}
-        if {".vhdr", ".vmrk", ".eeg"}.issubset(exts) or exts & {".edf", ".bdf", ".set", ".fif"}:
-            eeg_sets.append(sorted(group, key=lambda o: o.key))
-    eeg_sets = sorted(eeg_sets, key=lambda group: sum(o.size for o in group))
-    for group in eeg_sets[:max_eeg_sets]:
-        chosen.extend(group)
+    chosen.extend(choose_eeg_sets(small, max_eeg_sets))
 
     images = sorted([o for o in small if is_image(o.key)], key=lambda o: o.size)
     chosen.extend(images[:max_images])
@@ -149,8 +152,6 @@ def download_objects(dataset: str, objects: list[S3Object], target: Path) -> lis
         rel_key = relative_key_for_dataset(obj.key, dataset)
         dst = target / rel_key
         ensure_dir(dst.parent)
-        # AWS `s3 ls s3://openneuro.org/<dataset>/ --recursive` returns keys relative to the bucket,
-        # usually already prefixed by the dataset accession. Therefore copy directly from bucket/key.
         run([aws, "s3", "cp", f"s3://openneuro.org/{obj.key}", str(dst), "--no-sign-request", "--only-show-errors"])
         downloaded.append({"key": obj.key, "relative_key": rel_key, "local_path": str(dst), "size_bytes": obj.size})
     return downloaded
@@ -179,7 +180,7 @@ def quantize_nifti(path: Path, out_dir: Path, max_volumes: int = 4, spatial_stri
         if hi <= lo:
             hi = lo + 1.0
         q = np.rint((np.clip(arr, lo, hi) - lo) / (hi - lo) * 255.0).astype(np.uint8)
-        safe_name = str(path.name).replace(".nii.gz", "").replace(".nii", "")
+        safe_name = path.name.replace(".nii.gz", "").replace(".nii", "")
         out = out_dir / f"{safe_name}_nifti_uint8.npz"
         np.savez_compressed(out, volume_uint8=q, lo=np.float32(lo), hi=np.float32(hi), original_shape=np.array(img.shape))
         return {"source": str(path), "quantized": str(out), "shape": list(q.shape), "dtype": "uint8", "lo": float(lo), "hi": float(hi)}
@@ -206,6 +207,8 @@ def read_eeg_any(path: Path):
 
 def quantize_eeg(path: Path, out_dir: Path, seconds: float = 30.0, target_sfreq: float = 100.0) -> dict | None:
     if path.suffix.lower() not in {".vhdr", ".edf", ".bdf", ".set", ".fif"}:
+        return None
+    if "derivatives" in str(path).lower() or "_ica" in str(path).lower():
         return None
     try:
         raw = read_eeg_any(path)
