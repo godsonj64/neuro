@@ -9,19 +9,32 @@ Colab-ready research repository for neural encoding with the OpenNeuro NOD datas
   - fMRI: voxel-wise Ridge regression, `CORnet-S features → voxel activity`.
   - EEG: temporal response function model, `CORnet-S features over lags → millisecond EEG voltage`.
 
-This repository is designed to run on Google Colab with minimal manual setup. It avoids downloading the full datasets by default. Use subject/session/task filters first, then scale up.
+This repository is designed to run on Google Colab with minimal manual setup. For a tiny test, use the synthetic smoke test below. It downloads **no OpenNeuro data**.
 
 ---
 
-## 1. Quick Colab Run
+## 1. Tiny test run without big files
 
-Open `notebooks/colab_nod_encoding.ipynb`, or run the same commands in a Colab cell:
+Use this when you only want to confirm that the code works:
 
 ```bash
 !git clone https://github.com/godsonj64/neuro.git
 %cd neuro
 !bash scripts/setup_colab.sh
+!python -m nod_encoding.smoke_test --out results/smoke_test
 ```
+
+This creates small synthetic feature, fMRI, and EEG matrices, then validates:
+
+- fMRI Ridge regression
+- EEG lagged TRF design
+- cross-validated Pearson correlation and R² metrics
+
+No NIfTI, EEG, image, or OpenNeuro dataset files are downloaded.
+
+---
+
+## 2. Real OpenNeuro run
 
 Download a small subset first:
 
@@ -36,7 +49,7 @@ Extract CORnet-S features from stimulus images:
 !python -m nod_encoding.extract_cornet_features \
   --bids-root data/ds004496 \
   --out features/ds004496_cornets.h5 \
-  --layers V1 V2 V4 IT decoder \
+  --layers V1 V2 V4 IT \
   --batch-size 32
 ```
 
@@ -64,7 +77,7 @@ Train EEG TRF encoding:
 
 ---
 
-## 2. Repository Layout
+## 3. Repository Layout
 
 ```text
 neuro/
@@ -81,6 +94,7 @@ neuro/
     bids_utils.py
     fmri.py
     eeg.py
+    smoke_test.py
     train_fmri_ridge.py
     train_eeg_trf.py
     metrics.py
@@ -91,7 +105,7 @@ neuro/
 
 ---
 
-## 3. Scientific Pipeline
+## 4. Scientific Pipeline
 
 ### fMRI encoding
 
@@ -115,20 +129,20 @@ The script fits multi-output Ridge regression to predict sensor voltage over tim
 
 ---
 
-## 4. Practical Notes
+## 5. Practical Notes
 
-OpenNeuro datasets can be large. The default downloader supports a subset-oriented workflow. Start with one subject. Increase `--max-files` or remove it after verifying that the pipeline works.
+OpenNeuro datasets can be large. Use the smoke test first. Only download real data after the installation and small synthetic pipeline pass.
 
 The scripts are intentionally defensive: they search for BIDS-compatible `events.tsv`, stimulus columns, image paths, fMRI NIfTI files, and EEG files. If a dataset-specific column name differs, use CLI overrides such as `--stimulus-column`.
 
 ---
 
-## 5. Requirements
+## 6. Requirements
 
 Main dependencies are in `requirements.txt`. Colab setup is handled by `scripts/setup_colab.sh`.
 
 ---
 
-## 6. Citation Pointers
+## 7. Citation Pointers
 
 Please cite OpenNeuro datasets according to their dataset pages and cite CORnet-S / CORnet when using the pretrained model in publications.
