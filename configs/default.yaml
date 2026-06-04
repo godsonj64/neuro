@@ -1,0 +1,9 @@
+fmri_dataset: ds004496
+eeg_dataset: ds005811
+cornet_layers: [V1, V2, V4, IT]
+feature_pooling: adaptive_avg_pool_1x1
+ridge_alpha_fmri: 100.0
+ridge_alpha_eeg: 10.0
+eeg_tmin: -0.1
+eeg_tmax: 0.6
+random_state: 42
