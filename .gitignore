@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/
+features/
+results/
+cache/
+*.nii
+*.nii.gz
+*.vhdr
+*.eeg
+*.vmrk
+*.edf
+*.bdf
+*.set
+*.fif
