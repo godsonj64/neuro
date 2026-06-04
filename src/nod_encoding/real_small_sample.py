@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -52,6 +51,11 @@ def list_s3_objects(dataset: str) -> list[S3Object]:
     return objects
 
 
+def relative_key_for_dataset(key: str, dataset: str) -> str:
+    prefix = dataset.rstrip("/") + "/"
+    return key[len(prefix):] if key.startswith(prefix) else key
+
+
 def suffix_of_key(key: str) -> str:
     lower = key.lower()
     if lower.endswith(".nii.gz"):
@@ -88,7 +92,16 @@ def choose_small_objects(
     small = [o for o in objects if o.size <= max_bytes and o.size > 0]
     chosen: list[S3Object] = []
 
-    niftis = sorted([o for o in small if is_nifti(o.key) and "bold" in o.key.lower()], key=lambda o: o.size)
+    # Prefer actual BOLD fMRI files, then any non-derived NIfTI, then any NIfTI.
+    niftis = sorted(
+        [o for o in small if is_nifti(o.key) and "bold" in o.key.lower() and "/derivatives/" not in o.key.lower()],
+        key=lambda o: o.size,
+    )
+    if len(niftis) < max_nifti:
+        niftis = sorted(
+            [o for o in small if is_nifti(o.key) and "/derivatives/" not in o.key.lower()],
+            key=lambda o: o.size,
+        )
     if len(niftis) < max_nifti:
         niftis = sorted([o for o in small if is_nifti(o.key)], key=lambda o: o.size)
     chosen.extend(niftis[:max_nifti])
@@ -101,7 +114,7 @@ def choose_small_objects(
             stem = re.sub(r"\.(vhdr|vmrk|eeg|edf|bdf|set|fif)$", "", lower)
             eeg_by_stem[stem].append(o)
     eeg_sets = []
-    for stem, group in eeg_by_stem.items():
+    for _stem, group in eeg_by_stem.items():
         exts = {suffix_of_key(g.key) for g in group}
         if {".vhdr", ".vmrk", ".eeg"}.issubset(exts) or exts & {".edf", ".bdf", ".set", ".fif"}:
             eeg_sets.append(sorted(group, key=lambda o: o.key))
@@ -120,7 +133,6 @@ def choose_small_objects(
     text_priority = sorted(text_priority, key=lambda o: (0 if o.key.endswith("_events.tsv") else 1, o.size))
     chosen.extend(text_priority[:max_text])
 
-    # Deduplicate while preserving order.
     seen = set()
     unique = []
     for o in chosen:
@@ -134,10 +146,13 @@ def download_objects(dataset: str, objects: list[S3Object], target: Path) -> lis
     aws = require_aws_cli()
     downloaded = []
     for obj in objects:
-        dst = target / obj.key
+        rel_key = relative_key_for_dataset(obj.key, dataset)
+        dst = target / rel_key
         ensure_dir(dst.parent)
-        run([aws, "s3", "cp", f"s3://openneuro.org/{dataset}/{obj.key}", str(dst), "--no-sign-request", "--only-show-errors"])
-        downloaded.append({"key": obj.key, "local_path": str(dst), "size_bytes": obj.size})
+        # AWS `s3 ls s3://openneuro.org/<dataset>/ --recursive` returns keys relative to the bucket,
+        # usually already prefixed by the dataset accession. Therefore copy directly from bucket/key.
+        run([aws, "s3", "cp", f"s3://openneuro.org/{obj.key}", str(dst), "--no-sign-request", "--only-show-errors"])
+        downloaded.append({"key": obj.key, "relative_key": rel_key, "local_path": str(dst), "size_bytes": obj.size})
     return downloaded
 
 
@@ -152,6 +167,9 @@ def quantize_nifti(path: Path, out_dir: Path, max_volumes: int = 4, spatial_stri
         data = np.asanyarray(img.dataobj)
         if data.ndim == 4:
             data = data[..., :max_volumes]
+        elif data.ndim < 3:
+            print(f"Skipping NIfTI with ndim={data.ndim}: {path}")
+            return None
         data = data[::spatial_stride, ::spatial_stride, ::spatial_stride, ...]
         arr = np.asarray(data, dtype=np.float32)
         finite = np.isfinite(arr)
@@ -161,7 +179,8 @@ def quantize_nifti(path: Path, out_dir: Path, max_volumes: int = 4, spatial_stri
         if hi <= lo:
             hi = lo + 1.0
         q = np.rint((np.clip(arr, lo, hi) - lo) / (hi - lo) * 255.0).astype(np.uint8)
-        out = out_dir / (path.name.replace(".nii.gz", "").replace(".nii", "") + "_nifti_uint8.npz")
+        safe_name = str(path.name).replace(".nii.gz", "").replace(".nii", "")
+        out = out_dir / f"{safe_name}_nifti_uint8.npz"
         np.savez_compressed(out, volume_uint8=q, lo=np.float32(lo), hi=np.float32(hi), original_shape=np.array(img.shape))
         return {"source": str(path), "quantized": str(out), "shape": list(q.shape), "dtype": "uint8", "lo": float(lo), "hi": float(hi)}
     except Exception as exc:
@@ -193,9 +212,9 @@ def quantize_eeg(path: Path, out_dir: Path, seconds: float = 30.0, target_sfreq:
         raw.pick_types(eeg=True, meg=False, eog=False, stim=False, exclude=[])
         raw.resample(target_sfreq, verbose="ERROR")
         n = min(raw.n_times, int(seconds * raw.info["sfreq"]))
-        data = raw.get_data(start=0, stop=n).astype(np.float32)  # volts
+        data = raw.get_data(start=0, stop=n).astype(np.float32)
         microvolts = data * 1e6
-        q = np.clip(np.rint(microvolts * 10.0), -32768, 32767).astype(np.int16)  # 0.1 uV units
+        q = np.clip(np.rint(microvolts * 10.0), -32768, 32767).astype(np.int16)
         out = out_dir / (path.name.replace(path.suffix, "") + "_eeg_int16.npz")
         np.savez_compressed(out, eeg_int16=q, sfreq=np.float32(raw.info["sfreq"]), ch_names=np.array(raw.ch_names, dtype="U64"), unit="0.1 microvolt")
         return {"source": str(path), "quantized": str(out), "shape": list(q.shape), "dtype": "int16", "sfreq": float(raw.info["sfreq"])}
