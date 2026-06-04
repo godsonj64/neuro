@@ -14,7 +14,7 @@ def seed_everything(seed: int = 42) -> None:
     try:
         import torch
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all()
+        torch.cuda.manual_seed_all(seed)
     except Exception:
         pass
 
