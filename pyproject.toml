@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nod-neuroencoding"
+version = "0.1.0"
+description = "Colab-ready CORnet-S neural encoding for OpenNeuro NOD fMRI and EEG datasets."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
